@@ -300,6 +300,38 @@ public struct DirectoryFoldResult: Codable {
     public let bytesReclaimed: UInt64
 }
 
+/// Honest per-run accounting. `verifiedCommits` counts only files that were actually rewritten
+/// AND read back byte-identical with their metadata mirrored; everything else is a skip.
+public struct ReclaimSafetyTally: Codable {
+    public var filesHashed = 0
+    public var verifiedCommits = 0
+    public var skippedChangedSinceScan = 0
+    public var skippedOpenElsewhere = 0
+    public var skippedUnsafe = 0
+    public var skippedContentMismatch = 0
+    public var skippedIncompressible = 0
+    public var racesRolledBack = 0
+    public var errorsNothingChanged = 0
+    public var verifyFailuresRolledBack = 0
+    /// Originals left on disk beside their file because a swap-back failed (nothing deleted).
+    public var preservedBackups: [String] = []
+
+    mutating func record(_ rc: Int32, backup: String) {
+        switch rc {
+        case MF_COMMIT_OK: verifiedCommits += 1
+        case MF_COMMIT_SKIP_CHANGED: skippedChangedSinceScan += 1
+        case MF_COMMIT_SKIP_OPEN: skippedOpenElsewhere += 1
+        case MF_COMMIT_SKIP_UNSAFE: skippedUnsafe += 1
+        case MF_COMMIT_SKIP_MISMATCH: skippedContentMismatch += 1
+        case MF_COMMIT_SKIP_INCOMPRESSIBLE: skippedIncompressible += 1
+        case MF_COMMIT_RACE_ROLLED_BACK: racesRolledBack += 1
+        case MF_COMMIT_ERR_VERIFY: verifyFailuresRolledBack += 1
+        case MF_COMMIT_ERR_ROLLBACK: preservedBackups.append(backup)
+        default: errorsNothingChanged += 1
+        }
+    }
+}
+
 public struct ZeroMassReclaimReport: Codable {
     public let dryRun: Bool
     public let volumeAvailBeforeGiB: Double
@@ -308,7 +340,7 @@ public struct ZeroMassReclaimReport: Codable {
     public let vmImages: [VMImageCompactionResult]
     public let directoryFolds: [DirectoryFoldResult]
     public let totalLogicalReclaimedGiB: Double
-    public let sha256VerificationsPassed: Int
+    public let safety: ReclaimSafetyTally
     public let elapsedSeconds: Double
 }
 
@@ -369,7 +401,7 @@ public enum ZeroMassStorage {
         dryRun: Bool,
         openInodes: Set<UInt64>,
         seenBySizeAndHash: inout [String: (path: String, ino: UInt64)],
-        shaVerifiedCount: inout Int
+        tally: inout ReclaimSafetyTally
     ) -> DirectoryFoldResult {
         let fm = FileManager.default
         guard fm.fileExists(atPath: rootPath) else {
@@ -381,6 +413,9 @@ public enum ZeroMassStorage {
             let size: UInt64
             let ino: UInt64
             let physBytes: UInt64
+            /// Captured BEFORE hashing; every commit re-verifies it so edits made after the scan
+            /// (the old TOCTOU window) abort the rewrite instead of being silently reverted.
+            let fingerprint: mf_file_fingerprint_t
         }
 
         var sizeBuckets: [UInt64: [CandidateFile]] = [:]
@@ -402,24 +437,25 @@ public enum ZeroMassStorage {
                     continue
                 }
 
-                var st = stat()
-                guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { continue }
-                if st.st_nlink > 1 || st.st_size < 8192 { continue }
-                let ino = UInt64(st.st_ino)
+                var fp = mf_file_fingerprint_t()
+                guard mf_capture_fingerprint(path, &fp), (fp.mode & UInt32(S_IFMT)) == UInt32(S_IFREG) else { continue }
+                if fp.nlink > 1 || fp.size < 8192 { continue }
+                if fp.uid != getuid() { continue }
+                let ino = fp.ino
                 if openInodes.contains(ino) { continue }
                 scanned += 1
 
-                let sz = UInt64(st.st_size)
-                let phys = UInt64(st.st_blocks) * 512
+                let sz = fp.size
+                let phys = fp.blocks * 512
                 if phys == 0 { continue }
 
-                let cand = CandidateFile(path: path, size: sz, ino: ino, physBytes: phys)
+                let cand = CandidateFile(path: path, size: sz, ino: ino, physBytes: phys, fingerprint: fp)
                 if sz >= 16384 && sz <= 128 * 1024 * 1024 {
                     sizeBuckets[sz, default: []].append(cand)
                 }
 
-                let ageSec = now - Double(st.st_mtimespec.tv_sec)
-                if enableLzfseCompression && ageSec > 600 && (st.st_flags & UInt32(UF_COMPRESSED)) == 0 && phys >= 16384 {
+                let ageSec = now - Double(fp.mtime_sec)
+                if enableLzfseCompression && ageSec > 600 && (fp.flags & UInt32(UF_COMPRESSED)) == 0 && phys >= 16384 {
                     let isColdArtifact = path.contains("/.build/")
                         || path.contains("/target/debug/")
                         || path.contains("/target/release/deps/")
@@ -465,29 +501,32 @@ public enum ZeroMassStorage {
         var reclaimed: UInt64 = 0
         var deduplicatedPaths: Set<String> = []
 
+        // SHA-256 only *groups* candidates. Equality is proven byte-for-byte inside the kernel
+        // commit path, against the live file, immediately before the atomic swap.
+        var backupBuf = [CChar](repeating: 0, count: Int(PATH_MAX))
         for idx in 0..<toHash.count {
             guard let key = computedKeys[idx] else { continue }
-            shaVerifiedCount += 1
+            tally.filesHashed += 1
             let cand = toHash[idx]
 
             if let canon = seenBySizeAndHash[key], canon.ino != cand.ino, fm.fileExists(atPath: canon.path) {
-                var stCan = stat(), stDup = stat()
-                if lstat(canon.path, &stCan) == 0, lstat(cand.path, &stDup) == 0, stCan.st_dev == stDup.st_dev {
-                    if dryRun {
+                if dryRun {
+                    var cfp = mf_file_fingerprint_t()
+                    guard mf_capture_fingerprint(canon.path, &cfp), cfp.dev == cand.fingerprint.dev else { continue }
+                    clones += 1
+                    reclaimed += cand.physBytes
+                    deduplicatedPaths.insert(cand.path)
+                } else {
+                    var fp = cand.fingerprint
+                    var beforeB: UInt64 = 0
+                    let rc = mf_dedup_replace_with_clone(canon.path, cand.path, &fp, &beforeB, &backupBuf, backupBuf.count)
+                    tally.record(rc, backup: String(cString: backupBuf))
+                    if rc == MF_COMMIT_OK {
                         clones += 1
-                        reclaimed += cand.physBytes
-                        deduplicatedPaths.insert(cand.path)
-                    } else {
-                        let stage = cand.path + ".mf_clone_\(getpid())"
-                        var beforeB: UInt64 = 0
-                        if mf_stage_clonefile_dedup(canon.path, cand.path, stage, &beforeB) {
-                            if mf_commit_staged_file(cand.path, stage, false) {
-                                clones += 1
-                                reclaimed += beforeB
-                                deduplicatedPaths.insert(cand.path)
-                            }
-                        }
+                        reclaimed += beforeB
                     }
+                    // Whatever happened, this path's fingerprint is no longer trustworthy for LZFSE.
+                    deduplicatedPaths.insert(cand.path)
                 }
             } else {
                 seenBySizeAndHash[key] = (cand.path, cand.ino)
@@ -500,19 +539,13 @@ public enum ZeroMassStorage {
                 compressed += 1
                 reclaimed += UInt64(Double(cand.physBytes) * 0.65)
             } else {
-                guard let origDigest = sha256OfFile(path: cand.path) else { continue }
-                let stage = cand.path + ".mf_lzfse_\(getpid())"
+                var fp = cand.fingerprint
                 var b0: UInt64 = 0, b1: UInt64 = 0
-                if mf_stage_decmpfs_lzfse(cand.path, stage, &b0, &b1) {
-                    if let stageDigest = sha256OfFile(path: stage), stageDigest == origDigest, b0 > b1 {
-                        shaVerifiedCount += 1
-                        if mf_commit_staged_file(cand.path, stage, false) {
-                            compressed += 1
-                            reclaimed += (b0 - b1)
-                        }
-                    } else {
-                        unlink(stage)
-                    }
+                let rc = mf_lzfse_compress_in_place(cand.path, &fp, &b0, &b1, &backupBuf, backupBuf.count)
+                tally.record(rc, backup: String(cString: backupBuf))
+                if rc == MF_COMMIT_OK && b0 > b1 {
+                    compressed += 1
+                    reclaimed += (b0 - b1)
                 }
             }
         }
@@ -533,7 +566,7 @@ public enum ZeroMassStorage {
 
         var vmResults: [VMImageCompactionResult] = []
         var totalLogicalBytes: UInt64 = 0
-        var shaChecks = 0
+        var tally = ReclaimSafetyTally()
 
         for imgPath in discoverCandidateVMImages() {
             var logB: UInt64 = 0, pb: UInt64 = 0, pa: UInt64 = 0, punchB: UInt64 = 0
@@ -584,7 +617,7 @@ public enum ZeroMassStorage {
                 dryRun: dryRun,
                 openInodes: openInos,
                 seenBySizeAndHash: &seenHashes,
-                shaVerifiedCount: &shaChecks
+                tally: &tally
             )
             totalLogicalBytes += res.bytesReclaimed
             dirResults.append(res)
@@ -609,7 +642,7 @@ public enum ZeroMassStorage {
             vmImages: vmResults,
             directoryFolds: dirResults,
             totalLogicalReclaimedGiB: Double(totalLogicalBytes) / 1_073_741_824.0,
-            sha256VerificationsPassed: shaChecks,
+            safety: tally,
             elapsedSeconds: CFAbsoluteTimeGetCurrent() - t0
         )
     }

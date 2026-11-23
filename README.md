@@ -33,7 +33,21 @@ Yet running **Claude Desktop + 5× Claude Code terminals + Antigravity + ChatGPT
 * **Parallel Multi-Core APFS Zero-Mass Engine (`F_PUNCHHOLE` + `clonefile` CoW + Ring-0 `UF_COMPRESSED` `LZFSE`)**
   1. **NEON Sparse Hole Punching (`fcntl(F_PUNCHHOLE)`)**: Guarded by global `PROC_PIDFDVNODEPATHINFO` open-FD shields + `flock(LOCK_EX | LOCK_NB)`, punches `4 KB` zero runs in closed VM `.img`/`.raw` files into `0-byte` APFS sparse holes.
   2. **Parallel `FEAT_SHA256` Copy-on-Write Deduplication (`clonefile(2)`)**: Hashes multi-file size buckets across all CPU cores (`DispatchQueue.concurrentPerform`), coalescing `79,000+` duplicate dependency/cache files across `uv`, `bun`, `scratch`, `src`, `spawn`, and `Documents` into `0-byte` CoW clones without touching git-tracked source files.
-  3. **XNU Ring-0 Transparent `LZFSE` Folding (`CMP_Type11` / `CMP_Type12`)**: Compresses cold build/result artifacts in kernel space (up to `132×`), verifying **full `SHA-256` readback through XNU VFS before every atomic `rename()`**.
+  3. **XNU Ring-0 Transparent `LZFSE` Folding (`CMP_Type11` / `CMP_Type12`)**: Compresses cold build/result artifacts in kernel space (up to `132×`).
+
+### Reclaim safety model (v2.1)
+
+`reclaim` is a **preview by default**; nothing is rewritten without `--apply`. Every in-place rewrite (CoW dedup and LZFSE) goes through one kernel commit path that fails closed:
+
+1. **Fingerprint before hashing** (dev, inode, size, mtime, ctime, nlink). Any edit after the scan aborts the rewrite. SHA-256 only *groups* candidates.
+2. **Byte-for-byte comparison** of the staged replacement against the live file, read back through the VFS so the decmpfs decoding is exercised too.
+3. **Full metadata mirror, read back and checked**: xattrs (including `com.apple.quarantine` and Finder tags), the extended ACL, mode, group, `UF_HIDDEN`/`UF_NODUMP`, atime/mtime and birthtime. A duplicate keeps *its own* metadata, not the canonical file's.
+4. **Open-file shield right before and right after the swap**, using each process's full FD table (`dev`+`ino`).
+5. **Atomic `renamex_np(RENAME_SWAP)`**. If the original was written or opened during the swap, or the result does not read back identical, the original is swapped back. The original inode is deleted only after the replacement is verified. If even the swap-back fails, the original stays on disk as a hidden `.mfstage-*` file.
+
+Skipped: hardlinked files, files owned by another user, files with immutable/append/tracked/dataless or other special flags, and files with a real resource fork. `massflow verify` checks [16]–[22] attack each of these guarantees.
+
+Known limits: processes owned by other users (root daemons) and writers that hold only an `mmap` with no open FD are invisible to the shield. A writer that opens the path in the microseconds between the swap and a swap-back can lose that write.
 
 ---
 
@@ -43,7 +57,7 @@ Yet running **Claude Desktop + 5× Claude Code terminals + Antigravity + ChatGPT
 | :--- | :--- | :--- |
 | **`/System/Volumes/Data` Free Space (`df`)** | `51.77 GiB` (`88.7%` full) | **`66.78 GiB` (`+15.01 GiB` net physical SSD freed)** |
 | **Total Logical Extent Reduction** | — | **`+25.67 GiB` (`5.89 GiB` VM holes + `19.78 GiB` CoW/LZFSE)** |
-| **Files Deleted / `SHA-256` Mismatches** | — | **`0` deleted · `198,853` `SHA-256` checks `100%` exact** |
+| **Files Deleted / `SHA-256` Mismatches** | — | **`0` deleted · `198,853` files hashed** (v2.0 reported these as "verifications"; it counted hashed inputs, not verified commits. v2.1 reports verified rewrites separately.) |
 | **Encrypted SSD Swap Allocation** | `6,136.9 / 7,168.0 MiB` | **`5,173.2 / 6,144.0 MiB` (`-1.0 GiB` swapfile reclaimed)** |
 | **Cryo-Paused Buried Idle App Footprint** | `0 MiB` (timers waking every few sec) | **`3,375.9 MiB` across `40` buried PIDs (`1.0 µs` focus thaw)** |
 | **MCP `stdio` Spawns (`Claude`/`Cursor`/`Codex`)** | `29` duplicate procs (`1,080 MiB`) | **`1` shared warm broker (`0.098 ms` init) → `0.0 MiB` idle** |
@@ -60,9 +74,9 @@ swift build -c release
 
 massflow status --fast       # Instant live report (RAM/swap, cryo daemon, mux brokers & TCP shields)
 massflow top                 # Live 1 Hz terminal dashboard
-massflow verify              # Run 15 automated kernel, N→1→0 MCP, JSON/TOML & SHA-256 tests
-massflow reclaim --dry-run   # Preview lossless APFS Zero-Mass savings across all workspaces
-massflow reclaim             # Execute parallel SHA-256-verified lossless APFS reclamation
+massflow verify              # Run 22 automated kernel, N→1→0 MCP, config & reclaim-safety tests
+massflow reclaim             # Preview lossless APFS Zero-Mass savings (read-only)
+massflow reclaim --apply     # Perform it: fingerprinted, byte-verified, metadata-preserving rewrites
 massflow mcp-adopt           # Auto-wrap Claude Desktop, Claude Code, Cursor & Codex MCP configs
 massflow mcp-restore         # Roll back all MCP config files to original backups
 massflow thaw                # Immediately SIGCONT all cryo-paused background PIDs

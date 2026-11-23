@@ -4,7 +4,7 @@ import CryptoKit
 import Darwin
 import Foundation
 
-private let kMassflowVersion = "2.0.0"
+private let kMassflowVersion = "2.1.0"
 
 // MARK: - ANSI Styling
 
@@ -425,8 +425,21 @@ private func runReclaim(dryRun: Bool, json: Bool) {
                      ANSI.green, gib, ANSI.reset))
     }
     print("  ──────────────────────────────────────────────────────────────────────────")
-    print(String(format: "  %@Parallel SHA-256 Verifications%@ : %@%d passed (0 mismatches, 0 files deleted)%@",
-                 ANSI.bold, ANSI.reset, ANSI.green, report.sha256VerificationsPassed, ANSI.reset))
+    let t = report.safety
+    print("  \(ANSI.bold)Candidate files hashed\(ANSI.reset)         : \(t.filesHashed) (SHA-256 groups candidates; equality is proven byte-for-byte at commit)")
+    if dryRun {
+        print(String(format: "  %@Estimated reclaimable%@          : %@+%.2f GiB%@ in %.2fs (preview — nothing was modified)",
+                     ANSI.bold, ANSI.reset, ANSI.green, report.totalLogicalReclaimedGiB, ANSI.reset, report.elapsedSeconds))
+        print("  Run \(ANSI.bold)massflow reclaim --apply\(ANSI.reset) to perform it.\n")
+        return
+    }
+    print("  \(ANSI.bold)Verified rewrites\(ANSI.reset)              : \(ANSI.green)\(t.verifiedCommits)\(ANSI.reset) (byte-identical read-back, xattrs/ACL/mode/flags/times mirrored)")
+    print("  \(ANSI.bold)Skipped (left untouched)\(ANSI.reset)       : \(t.skippedChangedSinceScan) changed since scan · \(t.skippedOpenElsewhere) open elsewhere · \(t.skippedUnsafe) unsafe · \(t.skippedContentMismatch) content mismatch · \(t.skippedIncompressible) incompressible")
+    print("  \(ANSI.bold)Rolled back / errors\(ANSI.reset)           : \(t.racesRolledBack) races rolled back · \(t.verifyFailuresRolledBack) verify failures rolled back · \(t.errorsNothingChanged) errors (nothing changed)")
+    if !t.preservedBackups.isEmpty {
+        print("  \(ANSI.red)\(t.preservedBackups.count) original(s) preserved beside their file after a failed swap-back:\(ANSI.reset)")
+        for b in t.preservedBackups.prefix(20) { print("    \(b)") }
+    }
     print(String(format: "  %@Logical Extent Reduction%@       : %@+%.2f GiB%@ in %.2fs",
                  ANSI.bold, ANSI.reset, ANSI.green, report.totalLogicalReclaimedGiB, ANSI.reset, report.elapsedSeconds))
     if !dryRun {
@@ -482,9 +495,9 @@ private func runMCPRestore() throws {
 // MARK: - 4. `massflow verify` (15 Automated Kernel, Cryptographic, N->1->0 & Config Tests)
 
 private func runVerify() throws {
-    banner("MASSFLOW v\(kMassflowVersion) · 15-POINT KERNEL, N→1→0 MCP, CRYO & APFS SUITE")
+    let total = 22
+    banner("MASSFLOW v\(kMassflowVersion) · \(total)-POINT KERNEL, N→1→0 MCP, CRYO & APFS SUITE")
     var passed = 0
-    let total = 15
 
     func check(_ idx: Int, _ name: String, _ ok: Bool, _ detail: String) {
         let badge = ok ? "\(ANSI.green)PASS\(ANSI.reset)" : "\(ANSI.red)FAIL\(ANSI.reset)"
@@ -537,12 +550,13 @@ private func runVerify() throws {
     // [3] XNU Ring-0 `CMP_Type11` Inline LZFSE
     do {
         let f11 = tmpDir.appendingPathComponent("inline11.json").path
-        let stage11 = f11 + ".stage"
         let text = String(repeating: "{\"agent\":\"massflow\",\"status\":\"active\",\"delta_watts\":-14.6}\n", count: 250)
         try Data(text.utf8).write(to: URL(fileURLWithPath: f11))
         let sha0 = ZeroMassStorage.sha256OfFile(path: f11)
         var b0: UInt64 = 0, b1: UInt64 = 0
-        let committed = mf_stage_decmpfs_lzfse(f11, stage11, &b0, &b1) && mf_commit_staged_file(f11, stage11, true)
+        var fp11 = mf_file_fingerprint_t()
+        let committed = mf_capture_fingerprint(f11, &fp11)
+            && mf_lzfse_compress_in_place(f11, &fp11, &b0, &b1, nil, 0) == MF_COMMIT_OK
         let sha1 = ZeroMassStorage.sha256OfFile(path: f11)
         var st = stat()
         lstat(f11, &st)
@@ -553,7 +567,6 @@ private func runVerify() throws {
     // [4] XNU Ring-0 `CMP_Type12` 64 KB Random-Access Chunked LZFSE
     do {
         let f12 = tmpDir.appendingPathComponent("chunked12.bin").path
-        let stage12 = f12 + ".stage"
         var payload = Data()
         for i in 0..<8192 {
             payload.append(contentsOf: String(format: "LINE_%05d_MASSFLOW_KERNEL_LZFSE_RANDOM_ACCESS_CHUNK_TEST________\n", i % 64).utf8)
@@ -561,7 +574,9 @@ private func runVerify() throws {
         try payload.write(to: URL(fileURLWithPath: f12))
         let sha0 = ZeroMassStorage.sha256OfFile(path: f12)
         var b0: UInt64 = 0, b1: UInt64 = 0
-        let ok = mf_stage_decmpfs_lzfse(f12, stage12, &b0, &b1) && mf_commit_staged_file(f12, stage12, true)
+        var fp12 = mf_file_fingerprint_t()
+        let ok = mf_capture_fingerprint(f12, &fp12)
+            && mf_lzfse_compress_in_place(f12, &fp12, &b0, &b1, nil, 0) == MF_COMMIT_OK
         let rfd = open(f12, O_RDONLY)
         var slice = [UInt8](repeating: 0, count: 4096)
         let rn = pread(rfd, &slice, 4096, 199_999)
@@ -576,12 +591,13 @@ private func runVerify() throws {
     do {
         let fileA = tmpDir.appendingPathComponent("canon.bin").path
         let fileB = tmpDir.appendingPathComponent("dup.bin").path
-        let stageB = fileB + ".stage"
         let blob = Data((0..<131072).map { UInt8(($0 * 31) & 0xFF) })
         try blob.write(to: URL(fileURLWithPath: fileA))
         try blob.write(to: URL(fileURLWithPath: fileB))
         var beforeB: UInt64 = 0
-        let ok = mf_stage_clonefile_dedup(fileA, fileB, stageB, &beforeB) && mf_commit_staged_file(fileB, stageB, true)
+        var fpB = mf_file_fingerprint_t()
+        let ok = mf_capture_fingerprint(fileB, &fpB)
+            && mf_dedup_replace_with_clone(fileA, fileB, &fpB, &beforeB, nil, 0) == MF_COMMIT_OK
         let mfd = open(fileB, O_RDWR)
         var flip: UInt8 = 0xFF
         _ = pwrite(mfd, &flip, 1, 0)
@@ -799,6 +815,9 @@ private func runVerify() throws {
               "distinct project CWDs converge onto shared global broker \(sockA)")
     }
 
+    // [16..22] Reclaim safety: every in-place rewrite must fail closed or roll back losslessly.
+    try runReclaimSafetyChecks(tmpDir: tmpDir, check: check)
+
     print("\n  \(ANSI.bold)Verification Summary:\(ANSI.reset) \(passed == total ? ANSI.green : ANSI.red)\(passed)/\(total) invariants passed\(ANSI.reset)\n")
     if passed != total { exit(1) }
 }
@@ -886,8 +905,8 @@ private func printHelp() {
       Usage:
         massflow status [--fast] [--json]         Audit live RAM/swap, MCP mux brokers, shields & APFS space
         massflow top                              Live 1 Hz terminal telemetry dashboard
-        massflow verify                           Run 15 automated kernel, N→1→0 MCP, TOML/JSON & SHA-256 tests
-        massflow reclaim [--dry-run] [--json]     Deep lossless APFS Zero-Mass compaction (0 files deleted)
+        massflow verify                           Run 22 automated kernel, N→1→0 MCP, config & reclaim-safety tests
+        massflow reclaim [--apply] [--json]       Preview lossless APFS compaction; --apply performs it
         massflow mcp-adopt [--dry-run]            Auto-wrap Claude/Cursor/Codex MCP configs into N→1→0 mux
         massflow mcp-restore                      Restore original backed-up MCP config files
         massflow trim                             Immediately cryo-pause multi-hour idle background apps
@@ -910,7 +929,8 @@ do {
     case "verify":
         try runVerify()
     case "reclaim", "compact":
-        runReclaim(dryRun: rawArgs.contains("--dry-run"), json: wantJSON)
+        // Preview by default; rewriting files in place requires an explicit --apply.
+        runReclaim(dryRun: !rawArgs.contains("--apply") || rawArgs.contains("--dry-run"), json: wantJSON)
     case "mcp-adopt":
         try runMCPAdopt(dryRun: rawArgs.contains("--dry-run"))
     case "mcp-restore":
